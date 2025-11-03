@@ -14,6 +14,12 @@ MF-Agent is a financial knowledge base retrieval tool whose core structure is bu
 
 ![MF-Agent Framework](resource/images/framework.png)
 
+
+## Doc Link
+
+[AB Analysis](resource/docs/ab_analysis/README.md)
+
+
 ## 🚀 Quick Start
 
 ### Prerequisites
