@@ -22,7 +22,7 @@ class LightRAGKGBuilder(BaseKGBuilder):
     llm_client: BaseLLMClient = None
     max_loop: int = 3
 
-    async def extract(
+    async def extra ct(
         self, chunk: Chunk
     ) -> Tuple[Dict[str, List[dict]], Dict[Tuple[str, str], List[dict]]]:
         """
@@ -172,7 +172,7 @@ class LightRAGKGBuilder(BaseKGBuilder):
 
         3. 按出现次数降序排序；
 
-        4. 取第一个（出现次数最多的类型）作为最终 entity_type
+        4. 取第一个（出现次数最多的类型）作为最终  
         """
         entity_type = sorted(
             Counter([dp["entity_type"] for dp in node_data] + entity_types).items(),

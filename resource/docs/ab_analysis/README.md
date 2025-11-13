@@ -125,8 +125,8 @@
 
 思考4：lora训练是否要混入通用数据来保证通用能力呢？
 
-
 **先来看如下的评估结果**：
+
 <details>
 <summary><b>训练数据示例</summary>
 
@@ -165,7 +165,7 @@ shareGPT格式：
     <keywords> </keywords>
     <num> </num>
     <information> </information>
-
+    
     注意：实际训练的时候，我们还做了一道转换，因为我们打标签的时候都把特殊token打成了<></>的形式。而实际上qwen的special token是<|xx_start|><|xx_end|>的形式。
 
 思路流程如下：
@@ -222,8 +222,6 @@ shareGPT格式：
 2. 是否需要混入通用数据保证通用能力？
 
     需要，按比例混入了域数据量的5倍通用数据+2倍数学数据。效果达到最好。
-
-![Lora Loss曲线](resource/images/lora_loss.png)
 
 ---
 

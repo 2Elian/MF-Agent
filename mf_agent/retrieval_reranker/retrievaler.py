@@ -4,7 +4,8 @@
 # @Author  : lizimo@nuist.edu.cn
 # @File    : retrievaler.py
 # @Description: 检索器 + 负样本构造器
-
+import os
+import networkx as nx
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Union
 import torch
@@ -12,6 +13,7 @@ import logging
 from elasticsearch import Elasticsearch
 from pymilvus import Collection
 from neo4j import GraphDatabase
+from sentence_transformers import SentenceTransformer, util
 
 from mf_agent.models.bases import Intention, EsReturn, DetailReturn, MultiIntentReturn, MultiHopReturn, ReasoningReturn
 from mf_agent.knowledge_extract.index_builder import KnowledgeBase
@@ -19,7 +21,7 @@ from mf_agent.models.bases import Intention
 from mf_agent.utils.helper import compute_content_hash
 
 class MultiPolicyRetrievaler:
-    def __init__(self, knowledge_base, embedding_model, batch_size=4, device="cuda"):
+    def __init__(self, knowledge_base, embedding_model, batch_size=4, device="cuda", graph_raw_path: str = "/data/graph"):
         self.kb = knowledge_base
         self.embedding_model = embedding_model
         self.batch_size = batch_size
@@ -28,6 +30,7 @@ class MultiPolicyRetrievaler:
         self.milvus_collection = Collection("knowledge_embeddings")
         self.graph_driver = knowledge_base.graph_index_builder.driver
         self.logger = logging.getLogger("MF-Agent- MultiPolicyRetrievaler")
+        self.graph_raw_path = graph_raw_path
 
     # Distribute based on intent type
     def retrieve_knowledge(self, intention: Intention) -> Union[List[DetailReturn], List[MultiIntentReturn], List[MultiHopReturn], List[ReasoningReturn]]:
@@ -43,7 +46,7 @@ class MultiPolicyRetrievaler:
         elif question_type == "multi_intent":
             return self._retrieve_multi_intent(questions=question, keywords=keywords, entities=entities, range_title=range_title)
         elif question_type == "multi_hop":
-            return self._retrieve_multi_hop(question)
+            return self._retrieve_multi_hop(question, entities, range_title)
         elif question_type == "reasoning":
             return self._retrieve_reasoning(question)
         else:
@@ -79,17 +82,20 @@ class MultiPolicyRetrievaler:
                 results.extend(future.result())
         return self.embedding_retrievaler_multi(questions, results)
 
-    def _retrieve_multi_hop(self, question):
+    def _retrieve_multi_hop(self, question, entity, range_title, max_hops=2, top_k=5):
         # TODO
-        kg_results = self.knowledge_graph_retrievaler(question)
-        if not kg_results:
-            return []
-        return self.embedding_retrievaler(question, kg_results)
+        # step1 -> 找到图的位置
+        graph_path = os.path.join(self.graph_raw_path, range_title)
+        # step2 -> 实例化图检索器
+        retriever = GraphRetriever(graph_path, self.embedding_model)
+        # 返回结果
+        docs = retriever.knowledge_graph_multi_hop_retrieval(question, entity, max_hops=max_hops, top_k=top_k)
+        return docs
 
     def _retrieve_reasoning(self, question):
-        # TODO
-        step_results = self._retrieve_multi_hop(question)
-        return self.embedding_retrievaler(question, step_results)
+        # TODO 细节检索器+LLM推理
+        return 1
+
 
     def es_retrievaler(self, query, keywords, entities, range_title, size=20) -> Tuple[List[EsReturn], int]:
         should_clauses = []
@@ -334,6 +340,89 @@ class MultiPolicyRetrievaler:
 
     def get_range_title(self, document_title):
         return document_title.lower() if document_title else "default"
+
+
+class GraphRetriever:
+    def __init__(self, graphml_path: str,
+                 embedding_model):
+        assert os.path.exists(graphml_path), f"GraphML 文件不存在: {graphml_path}"
+        self.graph = nx.read_graphml(graphml_path)
+        self.model = embedding_model
+        print(f"已加载图谱：{graphml_path}")
+        print(f"包含 {self.graph.number_of_nodes()} 个节点，{self.graph.number_of_edges()} 条边")
+
+    def get_node_text(self, node_id: str) -> str:
+        node_data = self.graph.nodes[node_id]
+        name = node_data.get("name", "")
+        desc = node_data.get("desc", "")
+        label = node_data.get("label", "")
+        return f"{name} {label} {desc}".strip()
+
+    def find_entity_nodes(self, entities: list[str]) -> list[str]:
+        matched_nodes = []
+        for node_id, data in self.graph.nodes(data=True):
+            text = self.get_node_text(node_id)
+            for ent in entities:
+                if ent in text:
+                    matched_nodes.append(node_id)
+        return list(set(matched_nodes))
+
+    def multi_hop_expand(self, start_nodes: list[str], max_hops: int = 2) -> list[str]:
+        visited = set(start_nodes)
+        current_layer = set(start_nodes)
+
+        for _ in range(max_hops):
+            next_layer = set()
+            for node in current_layer:
+                neighbors = list(self.graph.neighbors(node))
+                for n in neighbors:
+                    if n not in visited:
+                        next_layer.add(n)
+            visited |= next_layer
+            current_layer = next_layer
+        return list(visited)
+
+    def rank_nodes_by_semantic(self, query: str, candidate_nodes: list[str], top_k: int = 10):
+        texts = [self.get_node_text(nid) for nid in candidate_nodes]
+        query_emb = self.model.encode(query, normalize_embeddings=True)
+        node_embs = self.model.encode(texts, normalize_embeddings=True)
+        scores = util.dot_score(query_emb, node_embs)[0].cpu().tolist()
+
+        ranked = sorted(zip(candidate_nodes, texts, scores), key=lambda x: x[2], reverse=True)[:top_k]
+        return [{"id": n, "content": t, "score": round(s, 4)} for n, t, s in ranked]
+
+    def knowledge_graph_multi_hop_retrieval(
+            self, query: str, entities: list[str], max_hops: int = 2, top_k: int = 5
+    ):
+        start_nodes = self.find_entity_nodes(entities)
+        if not start_nodes:
+            print("没有命中实体节点，尝试全图语义检索")
+            all_nodes = list(self.graph.nodes())
+            return self.rank_nodes_by_semantic(query, all_nodes, top_k=top_k)
+
+        candidate_nodes = self.multi_hop_expand(start_nodes, max_hops=max_hops)
+
+        ranked_results = self.rank_nodes_by_semantic(query, candidate_nodes, top_k=top_k)
+        return ranked_results
+
+    def knowledge_graph_retrieval(self, query: str, top_k: int = 5):
+        node_texts = []
+        node_ids = list(self.graph.nodes())
+
+        for node_id in node_ids:
+            text = self.get_node_text(node_id)
+            if text.strip():
+                node_texts.append(text)
+            else:
+                node_texts.append(node_id)
+
+        query_emb = self.model.encode(query, normalize_embeddings=True)
+        node_embs = self.model.encode(node_texts, normalize_embeddings=True)
+        scores = util.dot_score(query_emb, node_embs)[0].cpu().tolist()
+
+        ranked = sorted(zip(node_ids, node_texts, scores), key=lambda x: x[2], reverse=True)[:top_k]
+        results = [{"id": node_id, "content": text, "score": round(score, 4)} for node_id, text, score in ranked]
+        return results
 
 if __name__ == "__main__":
     kb = KnowledgeBase(embedding_model_name="your_embedding_model")
